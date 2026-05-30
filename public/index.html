@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>VideoHub | Mux + Firebase</title>
+  <script src="https://cdn.jsdelivr.net/npm/@mux/mux-uploader@2.5.0/dist/mux-uploader.min.js"></script>
+  <script type="module">
+    // Firebase SDKs (Modular)
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+    import { 
+      getAuth, onAuthStateChanged, signInWithEmailAndPassword, 
+      createUserWithEmailAndPassword, signInWithPopup, GoogleAuthProvider,
+      signOut 
+    } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+    import { 
+      getFirestore, collection, addDoc, query, where, 
+      orderBy, onSnapshot, serverTimestamp, doc, updateDoc 
+    } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+    // 🔑 Firebase Config (Replace with your actual config)
+    const firebaseConfig = {
+      apiKey: "AIzaSyDYitOx64K3fc5GMr9kBnsYoOYiqnNOfTA",
+      authDomain: "vite-project-76e9b.firebaseapp.com",
+      projectId: "vite-project-76e9b",
+      storageBucket: "vite-project-76e9b.firebasestorage.app",
+      messagingSenderId: "555019678836",
+      appId: "1:555019678836:web:51650d0828a98bf9508d21"
+    };
+
+    // Initialize Firebase
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+    const provider = new GoogleAuthProvider();
+
+    // 🌐 Cloud Function URL (ডিপ্লয় করার পর আপডেট করুন)
+    const CREATE_UPLOAD_URL = "https://YOUR_REGION-YOUR_PROJECT.cloudfunctions.net/createMuxUpload";
+
+    // DOM Elements
+    const $ = (id) => document.getElementById(id);
+    const authSection = $('auth-section');
+    const guestView = $('guest-view');
+    const uploadSection = $('upload-section');
+    const videoGrid = $('video-grid');
+    const statusMsg = $('status-msg');
+    const muxUploader = $('mux-uploader');
+    const uploadBtn = $('upload-btn');
+    const loginForm = $('login-form');
+    const signupForm = $('signup-form');    const googleBtn = $('google-signin');
+    const logoutBtn = $('logout-btn');
+    const userEmail = $('user-email');
+    const themeToggle = $('theme-toggle');
+
+    let currentUser = null;
+    let darkMode = localStorage.getItem('darkMode') === 'true';
+
+    // 🌓 Dark/Light Mode
+    function applyTheme() {
+      document.body.classList.toggle('dark', darkMode);
+      themeToggle.textContent = darkMode ? '☀️ লাইট' : '🌙 ডার্ক';
+    }
+    themeToggle.onclick = () => {
+      darkMode = !darkMode;
+      localStorage.setItem('darkMode', darkMode);
+      applyTheme();
+    };
+    applyTheme();
+
+    // 🔐 Auth State Listener
+    onAuthStateChanged(auth, (user) => {
+      currentUser = user;
+      if (user) {
+        authSection.classList.add('hidden');
+        guestView.classList.remove('hidden');
+        uploadSection.classList.remove('hidden');
+        userEmail.textContent = user.email;
+        loadVideos(); // Load all videos for logged-in user
+      } else {
+        authSection.classList.remove('hidden');
+        guestView.classList.remove('hidden');
+        uploadSection.classList.add('hidden');
+        loadVideos(true); // Load only public videos for guest
+      }
+    });
+
+    // 📤 Upload Button Click
+    uploadBtn?.addEventListener('click', async () => {
+      if (!currentUser) {
+        alert('ভিডিও আপলোড করতে লগইন করুন!');
+        return;
+      }
+      try {
+        statusMsg.textContent = '🔗 আপলোড লিংক তৈরি হচ্ছে...';
+        const idToken = await currentUser.getIdToken();
+        
+        const res = await fetch(CREATE_UPLOAD_URL, {
+          method: 'POST',
+          headers: {            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${idToken}`
+          },
+          body: JSON.stringify({ filename: 'video.mp4' })
+        });
+        
+        if (!res.ok) throw new Error('Backend error');
+        const data = await res.json();
+        
+        // Configure Mux Uploader
+        muxUploader.endpoint = data.url;
+        muxUploader.hidden = false;
+        
+        // Save metadata to Firestore before upload completes
+        await addDoc(collection(db, 'videos'), {
+          uploadId: data.id,
+          userId: currentUser.uid,
+          fileName: 'video.mp4',
+          status: 'uploading',
+          isPublic: true,
+          createdAt: serverTimestamp()
+        });
+        
+        statusMsg.textContent = '📤 ফাইল সিলেক্ট করুন বা ড্র্যাগ করুন';
+      } catch (err) {
+        statusMsg.textContent = `❌ ${err.message}`;
+        statusMsg.className = 'status error';
+      }
+    });
+
+    // ✅ Mux Upload Success
+    muxUploader?.addEventListener('success', async (e) => {
+      statusMsg.textContent = '⏳ ভিডিও প্রসেসিং হচ্ছে...';
+      statusMsg.className = 'status processing';
+      
+      // Update Firestore with mux_asset_id when available
+      // Note: In production, use Mux webhook for reliable status updates
+      const videosRef = collection(db, 'videos');
+      const q = query(videosRef, where('uploadId', '==', e.detail.uploadId), where('userId', '==', currentUser.uid));
+      const snapshot = await onSnapshot(q, (snap) => {
+        snap.forEach(async (docRef) => {
+          // Polling fallback: Check Mux API via Cloud Function for asset status
+          // For demo, we assume processing completes in 1-2 min
+          setTimeout(async () => {
+            await updateDoc(doc(db, 'videos', docRef.id), {
+              status: 'ready',
+              // playbackId will be set via webhook in production
+            });
+          }, 90000);
+        });      });
+    });
+
+    // 🔑 Authentication Handlers
+    loginForm?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const email = $('login-email').value;
+      const pass = $('login-pass').value;
+      try {
+        await signInWithEmailAndPassword(auth, email, pass);
+        statusMsg.textContent = '✅ লগইন সফল!';
+        statusMsg.className = 'status success';
+      } catch (err) {
+        statusMsg.textContent = `❌ ${err.message}`;
+        statusMsg.className = 'status error';
+      }
+    });
+
+    signupForm?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const email = $('signup-email').value;
+      const pass = $('signup-pass').value;
+      try {
+        await createUserWithEmailAndPassword(auth, email, pass);
+        statusMsg.textContent = '✅ অ্যাকাউন্ট তৈরি হয়েছে!';
+        statusMsg.className = 'status success';
+      } catch (err) {
+        statusMsg.textContent = `❌ ${err.message}`;
+        statusMsg.className = 'status error';
+      }
+    });
+
+    googleBtn?.addEventListener('click', () => {
+      signInWithPopup(auth, provider).catch(err => {
+        statusMsg.textContent = `❌ ${err.message}`;
+        statusMsg.className = 'status error';
+      });
+    });
+
+    logoutBtn?.addEventListener('click', () => signOut(auth));
+
+    // 🎬 Load Videos from Firestore
+    function loadVideos(guestMode = false) {
+      const videosRef = collection(db, 'videos');
+      let q = query(videosRef, orderBy('createdAt', 'desc'));
+      
+      if (guestMode) {
+        q = query(videosRef, where('isPublic', '==', true), where('status', '==', 'ready'), orderBy('createdAt', 'desc'));
+      } else if (currentUser) {
+        q = query(videosRef, where('userId', '==', currentUser.uid), orderBy('createdAt', 'desc'));      }
+      
+      onSnapshot(q, (snapshot) => {
+        videoGrid.innerHTML = '';
+        if (snapshot.empty) {
+          videoGrid.innerHTML = '<p class="empty">কোন ভিডিও নেই</p>';
+          return;
+        }
+        
+        snapshot.forEach((docSnap) => {
+          const video = docSnap.data();
+          const card = document.createElement('div');
+          card.className = 'video-card';
+          
+          if (video.status === 'ready' && video.playbackId) {
+            card.innerHTML = `
+              <mux-player playback-id="${video.playbackId}" metadata-video-title="${video.fileName}" accent-color="#6366f1"></mux-player>
+              <p><strong>${video.fileName}</strong></p>
+              <small>আপলোড: ${video.createdAt?.toDate?.().toLocaleDateString('bn-BD') || '...'}</small>
+            `;
+          } else {
+            card.innerHTML = `
+              <div class="placeholder">🎬 ${video.status === 'uploading' ? 'আপলোড হচ্ছে...' : 'প্রসেসিং...'}</div>
+              <p><strong>${video.fileName}</strong></p>
+              <small>${video.createdAt?.toDate?.().toLocaleDateString('bn-BD') || '...'}</small>
+            `;
+          }
+          videoGrid.appendChild(card);
+        });
+      });
+    }
+
+    // Initialize
+    if (muxUploader) muxUploader.hidden = true;
+  </script>
+
+  <style>
+    :root { --bg: #f8fafc; --card: #fff; --text: #1e293b; --primary: #6366f1; --border: #e2e8f0; }
+    .dark { --bg: #0f172a; --card: #1e293b; --text: #f1f5f9; --border: #334155; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; padding: 16px; transition: background 0.3s; }
+    .container { max-width: 1200px; margin: 0 auto; }
+    header { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
+    h1 { font-size: 1.5rem; }
+    .auth-card, .upload-card { background: var(--card); padding: 20px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 24px; }
+    .form-group { margin: 12px 0; }
+    input { width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); }
+    button { background: var(--primary); color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: 500; }
+    button:hover { opacity: 0.9; }
+    .google-btn { background: #db4437; margin-top: 8px; width: 100%; }    .status { padding: 10px; border-radius: 6px; text-align: center; margin: 12px 0; }
+    .status.success { background: #dcfce7; color: #166534; }
+    .status.error { background: #fee2e2; color: #991b1b; }
+    .status.processing { background: #fef3c7; color: #92400e; }
+    .video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+    .video-card { background: var(--card); border-radius: 12px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+    .video-card mux-player, .placeholder { width: 100%; aspect-ratio: 16/9; background: #000; display: flex; align-items: center; justify-content: center; color: white; }
+    .video-card p { padding: 12px; font-weight: 500; }
+    .video-card small { padding: 0 12px 12px; color: #64748b; display: block; }
+    .hidden { display: none !important; }
+    .auth-tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+    .auth-tabs button { flex: 1; background: var(--border); color: var(--text); }
+    .auth-tabs button.active { background: var(--primary); color: white; }
+    .user-info { display: flex; align-items: center; gap: 12px; }
+    mux-uploader { --mux-uploader-border: 2px dashed var(--border); --mux-uploader-border-hover: 2px dashed var(--primary); }
+    @media (max-width: 600px) { header { flex-direction: column; gap: 12px; } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🎬 VideoHub</h1>
+      <div class="user-info">
+        <button id="theme-toggle">🌙 ডার্ক</button>
+        <span id="user-email" class="hidden"></span>
+        <button id="logout-btn" class="hidden">লগআউট</button>
+      </div>
+    </header>
+
+    <!-- Auth Section -->
+    <div id="auth-section" class="auth-card hidden">
+      <div class="auth-tabs">
+        <button id="tab-login" class="active">লগইন</button>
+        <button id="tab-signup">সাইনআপ</button>
+      </div>
+      
+      <form id="login-form">
+        <div class="form-group"><input type="email" id="login-email" placeholder="ইমেইল" required></div>
+        <div class="form-group"><input type="password" id="login-pass" placeholder="পাসওয়ার্ড" required></div>
+        <button type="submit">লগইন</button>
+      </form>
+      
+      <form id="signup-form" class="hidden">
+        <div class="form-group"><input type="email" id="signup-email" placeholder="ইমেইল" required></div>
+        <div class="form-group"><input type="password" id="signup-pass" placeholder="পাসওয়ার্ড (৬+ অক্ষর)" required minlength="6"></div>
+        <button type="submit">অ্যাকাউন্ট তৈরি</button>
+      </form>
+      
+      <button id="google-signin" class="google-btn">🔑 Google দিয়ে সাইন ইন</button>
+      <div id="status-msg" class="status"></div>    </div>
+
+    <!-- Guest View: Video Grid -->
+    <div id="guest-view" class="hidden">
+      <h2>📺 ভিডিও সমূহ</h2>
+      <div id="video-grid" class="video-grid"></div>
+    </div>
+
+    <!-- Upload Section (Login Required) -->
+    <div id="upload-section" class="upload-card hidden">
+      <h2>⬆️ নতুন ভিডিও আপলোড</h2>
+      <p style="margin:8px 0 16px; color:#64748b">সর্বোচ্চ ৫০০MB • MP4, WebM সাপোর্টেড</p>
+      <button id="upload-btn">আপলোড শুরু</button>
+      <mux-uploader id="mux-uploader" drop></mux-uploader>
+      <div id="upload-status" class="status"></div>
+    </div>
+  </div>
+
+  <script>
+    // Auth Tab Switcher
+    document.getElementById('tab-login')?.addEventListener('click', function() {
+      document.getElementById('login-form').classList.remove('hidden');
+      document.getElementById('signup-form').classList.add('hidden');
+      this.classList.add('active');
+      document.getElementById('tab-signup').classList.remove('active');
+    });
+    document.getElementById('tab-signup')?.addEventListener('click', function() {
+      document.getElementById('signup-form').classList.remove('hidden');
+      document.getElementById('login-form').classList.add('hidden');
+      this.classList.add('active');
+      document.getElementById('tab-login').classList.remove('active');
+    });
+    // Load Mux Player component dynamically
+    const muxScript = document.createElement('script');
+    muxScript.src = 'https://cdn.jsdelivr.net/npm/@mux/mux-player@2.5.0/dist/mux-player.min.js';
+    document.head.appendChild(muxScript);
+  </script>
+</body>
+</html>
